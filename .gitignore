@@ -1,0 +1,5 @@
+.venv
+*.pt
+coco
+*.zip
+__pycache__
