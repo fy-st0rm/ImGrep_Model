@@ -74,8 +74,6 @@ for epoch in range(EPOCHS):
 	total_loss = 0
 
 	for i, (images, texts) in enumerate(loader):
-		if (i >= 5):
-			break
 		print(f"  -Batch {i}")
 		images = images.to(device)
 		token_ids = [tokenizer.encode(t)[:MAX_LEN] for t in texts]

@@ -1,13 +1,14 @@
 import os
 import torch
+import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
-from model import VisionTransformer, TextEncoder, BPETokenizer
+from model import VisionTransformer, TextEncoder, CLIPModel, BPETokenizer
 from dotenv import load_dotenv
+import numpy as np
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load the .env file from the current directory
 load_dotenv()
 
 # Parameters
@@ -17,86 +18,202 @@ MODEL_PATH = f"clip_epoch_{EPOCHS}.pt"
 MAX_LEN = int(os.getenv("MAX_LEN"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE"))
 
-# Load tokenizer
-tokenizer = BPETokenizer("vocab.json", "merges.txt")
-vocab_size = len(tokenizer.vocab)
+class ImprovedCLIPSearch:
+    def __init__(self, model_path, vocab_file="vocab.json", merges_file="merges.txt"):
+        # Load tokenizer
+        self.tokenizer = BPETokenizer(vocab_file, merges_file)
+        vocab_size = len(self.tokenizer.vocab)
 
-# Load models
-image_encoder = VisionTransformer()
-text_encoder = TextEncoder(vocab_size)
-# Assuming your full model combines both, or separate
-# You may have a combined model class, if so, load that
+        # Initialize model components
+        image_encoder = VisionTransformer()
+        text_encoder = TextEncoder(vocab_size)
+        self.model = CLIPModel(image_encoder, text_encoder)
 
-image_encoder.load_state_dict(torch.load(MODEL_PATH)["model_state_dict"], strict=False)
-text_encoder.load_state_dict(torch.load(MODEL_PATH)["model_state_dict"], strict=False)
+        checkpoint = torch.load(model_path, map_location=device)
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.model.to(device).eval()
 
-image_encoder.to(device).eval()
-text_encoder.to(device).eval()
+        # Image preprocessing (use ImageNet normalization for better results)
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-# Image transform (same as training)
-transform = transforms.Compose([
-	transforms.Resize((224, 224)),
-	transforms.ToTensor(),
-	transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
+        # Cache for embeddings
+        self.image_embeddings = None
+        self.image_names = None
 
-# Load and encode all test images once
-def load_images(img_dir):
-	images = []
-	image_names = []
-	for fname in os.listdir(img_dir):
-		if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-			path = os.path.join(img_dir, fname)
-			try:
-				img = Image.open(path).convert("RGB")
-				img = transform(img)
-				images.append(img)
-				image_names.append(fname)
-			except:
-				print(f"Failed to load {fname}")
-	return torch.stack(images), image_names
+    def load_and_encode_images(self, img_dir, batch_size=32):
+        print("Loading images...")
+        images = []
+        image_names = []
 
-def encode_images(images):
-	with torch.no_grad():
-		images = images.to(device)
-		embeddings = image_encoder(images)  # (N, embed_dim)
-		embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
-	return embeddings.cpu()
+        # Load all images first
+        for fname in os.listdir(img_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff")):
+                path = os.path.join(img_dir, fname)
+                try:
+                    img = Image.open(path).convert("RGB")
+                    img = self.transform(img)
+                    images.append(img)
+                    image_names.append(fname)
+                except Exception as e:
+                    print(f"Failed to load {fname}: {e}")
 
-def encode_text(text):
-	token_ids = tokenizer.encode(text)[:MAX_LEN]
-	token_ids += [0] * (MAX_LEN - len(token_ids))
-	token_ids = torch.tensor([token_ids]).to(device)
-	with torch.no_grad():
-		text_emb = text_encoder(token_ids)  # (1, embed_dim)
-		text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
-	return text_emb.cpu()
+        print(f"Loaded {len(images)} images")
 
-def search(text, image_embeddings, image_names, top_k=3):
-	text_emb = encode_text(text)
-	# Cosine similarity
-	similarities = (image_embeddings @ text_emb.T).squeeze(1)  # (N,)
+        # Encode images in batches
+        print("Encoding images...")
+        all_embeddings = []
 
-	top_scores, top_idxs = torch.topk(similarities, top_k)
-	results = [(image_names[i.item()], top_scores[idx].item()) for idx, i in enumerate(top_idxs)]
-	return results
+        with torch.no_grad():
+            for i in tqdm(range(0, len(images), batch_size)):
+                batch_images = torch.stack(images[i:i+batch_size]).to(device)
+
+                # Get image embeddings through the full model
+                img_features = self.model.image_encoder(batch_images)
+                img_features = self.model.image_proj(img_features)
+                img_features = F.normalize(img_features, dim=-1)
+
+                all_embeddings.append(img_features.cpu())
+
+        self.image_embeddings = torch.cat(all_embeddings, dim=0)
+        self.image_names = image_names
+        print(f"Encoded {len(self.image_embeddings)} image embeddings")
+
+    def encode_text(self, text):
+        # Improved text preprocessing
+        text = text.strip().lower()
+        if not text:
+            return None
+
+        # Tokenize with proper padding/truncation
+        token_ids = self.tokenizer.encode(text)[:MAX_LEN]
+        if len(token_ids) == 0:
+            token_ids = [0]  # fallback for empty tokenization
+
+        # Pad to max length
+        token_ids += [0] * (MAX_LEN - len(token_ids))
+        token_ids = torch.tensor([token_ids]).to(device)
+
+        with torch.no_grad():
+            text_features = self.model.text_encoder(token_ids)
+            text_features = self.model.text_proj(text_features)
+            text_features = F.normalize(text_features, dim=-1)
+
+        return text_features.cpu()
+
+    def search(self, query, top_k=5, threshold=0.1):
+        if self.image_embeddings is None:
+            raise ValueError("Images not loaded. Call load_and_encode_images first.")
+
+        text_embedding = self.encode_text(query)
+        if text_embedding is None:
+            return []
+
+        # Compute similarities
+        similarities = (self.image_embeddings @ text_embedding.T).squeeze(-1)
+
+        # Apply threshold filter
+        valid_indices = similarities > threshold
+        if not valid_indices.any():
+            print(f"No images found above similarity threshold {threshold}")
+            # Return top results anyway but with warning
+            valid_indices = torch.ones_like(similarities, dtype=torch.bool)
+
+        filtered_similarities = similarities[valid_indices]
+        filtered_names = [self.image_names[i] for i in range(len(self.image_names)) if valid_indices[i]]
+
+        # Get top-k results
+        if len(filtered_similarities) > 0:
+            top_k = min(top_k, len(filtered_similarities))
+            top_scores, top_indices = torch.topk(filtered_similarities, top_k)
+
+            results = []
+            for idx, score in zip(top_indices, top_scores):
+                results.append({
+                    'filename': filtered_names[idx],
+                    'similarity': score.item(),
+                    'confidence': 'high' if score.item() > 0.3 else 'medium' if score.item() > 0.15 else 'low'
+                })
+            return results
+
+        return []
+
+    def batch_search(self, queries, top_k=5):
+        results = {}
+        for query in queries:
+            results[query] = self.search(query, top_k)
+        return results
+
+    def get_image_stats(self):
+        if self.image_embeddings is None:
+            return None
+
+        return {
+            'total_images': len(self.image_embeddings),
+            'embedding_dim': self.image_embeddings.shape[1],
+            'avg_norm': self.image_embeddings.norm(dim=-1).mean().item(),
+            'embedding_std': self.image_embeddings.std().item()
+        }
+
 
 def main():
-	print("Loading images...")
-	images, image_names = load_images(IMG_DIR)
-	print(f"Loaded {len(images)} images")
+    # Initialize search system
+    searcher = ImprovedCLIPSearch(MODEL_PATH)
 
-	print("Encoding images...")
-	image_embeddings = encode_images(images)
+    # Load and encode all images
+    searcher.load_and_encode_images(IMG_DIR, batch_size=16)  # Adjust batch size based on GPU memory
 
-	while True:
-		query = input("Enter search text (or 'quit' to exit): ").strip()
-		if query.lower() == "quit":
-			break
-		results = search(query, image_embeddings, image_names)
-		print("Top matches:")
-		for fname, score in results:
-			print(f"Image: {fname} | Similarity: {score:.4f}")
+    # Print stats
+    stats = searcher.get_image_stats()
+    if stats:
+        print(f"\nDataset Stats:")
+        print(f"  Total images: {stats['total_images']}")
+        print(f"  Embedding dimension: {stats['embedding_dim']}")
+        print(f"  Average embedding norm: {stats['avg_norm']:.4f}")
+        print(f"  Embedding std: {stats['embedding_std']:.4f}")
+
+    # Interactive search
+    print("\n" + "="*50)
+    print("CLIP Image Search Ready!")
+    print("="*50)
+
+    while True:
+        query = input("\nEnter search query (or 'quit' to exit): ").strip()
+        if query.lower() == "quit":
+            break
+
+        if not query:
+            continue
+
+        print(f"\nSearching for: '{query}'")
+        results = searcher.search(query, top_k=5, threshold=0.05)
+
+        if results:
+            print(f"\nTop {len(results)} matches:")
+            print("-" * 60)
+            for i, result in enumerate(results, 1):
+                confidence_emoji = "🟢" if result['confidence'] == 'high' else "🟡" if result['confidence'] == 'medium' else "🔴"
+                print(f"{i}. {result['filename']}")
+                print(f"   Similarity: {result['similarity']:.4f} {confidence_emoji} ({result['confidence']})")
+        else:
+            print("No matching images found. Try a different query.")
+
+        # Option for batch search
+        batch_input = input("\nEnter multiple queries separated by semicolons (or press Enter to continue): ").strip()
+        if batch_input:
+            queries = [q.strip() for q in batch_input.split(';') if q.strip()]
+            if queries:
+                print("\nBatch search results:")
+                batch_results = searcher.batch_search(queries)
+                for query, results in batch_results.items():
+                    print(f"\n'{query}': {len(results)} matches")
+                    for result in results[:3]:  # Show top 3 for each
+                        print(f"  - {result['filename']} ({result['similarity']:.3f})")
+
 
 if __name__ == "__main__":
-	main()
+    main()
+
